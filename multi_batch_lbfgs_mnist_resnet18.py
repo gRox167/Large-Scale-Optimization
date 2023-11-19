@@ -35,7 +35,7 @@ import torch.nn.functional as F
 from torchvision.models.resnet import resnet18 as _resnet18
 from einops import rearrange, reduce, repeat
 
-from tensorflow.keras.datasets import mnist # to load dataset
+from tensorflow.keras.datasets import mnist, cifar10 # to load dataset
 
 from functions.utils import compute_stats, get_grad
 from functions.LBFGS import LBFGS
@@ -48,13 +48,17 @@ overlap_ratio = 0.25                # should be in (0, 0.5)
 lr = 1
 
 # Load data
-(X_train, y_train), (X_test, y_test) = mnist.load_data()
+(X_train, y_train), (X_test, y_test) = cifar10.load_data()
 X_train = X_train.astype('float32')
 X_test = X_test.astype('float32')
 X_train = X_train / 255
 X_test = X_test / 255
-X_train = repeat(X_train, 'b h w -> b c h w', c = 3)
-X_test = repeat(X_test, 'b h w -> b c h w', c = 3)
+if len(X_train.shape) == 3:
+    X_train = repeat(X_train, 'b h w -> b c h w', c = 3)
+    X_test = repeat(X_test, 'b h w -> b c h w', c = 3)
+else:
+    X_train = rearrange(X_train, 'b h w c -> b c h w')
+    X_test = rearrange(X_test, 'b h w c -> b c h w')
 # X_train = np.transpose(X_train, (0, 3, 1, 2))
 # X_test = np.transpose(X_test, (0, 3, 1, 2))
 
