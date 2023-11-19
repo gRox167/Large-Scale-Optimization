@@ -1,143 +1,169 @@
-"""
-Full-Batch L-BFGS Implementation with Wolfe Line Search
-
-Demonstrates how to implement a simple full-batch L-BFGS with weak Wolfe line search 
-without Powell damping to train a simple convolutional neural network using the LBFGS 
-optimizer.
-
-This implementation is CUDA-compatible.
-
-Implemented by: Hao-Jun Michael Shi and Dheevatsa Mudigere
-Last edited 10/20/20.
-
-Requirements:
-    - Keras (for CIFAR-10 dataset)
-    - NumPy
-    - PyTorch
-
-Run Command:
-    python full_batch_lbfgs_example.py
-
-"""
-import numpy as np
 import torch
-import torch.optim
+import torchvision
+import torchvision.transforms as transforms
+
+import math
+import time
+
+# (try to) use a GPU for computation?
+use_cuda=True
+if use_cuda and torch.cuda.is_available():
+  mydevice=torch.device('cuda')
+else:
+  mydevice=torch.device('cpu')
+
+
+# try replacing relu with elu
+torch.manual_seed(42)
+default_batch=128 # no. of batches per epoch 50000/default_batch
+batches_for_report=10#
+
+transform=transforms.Compose(
+   [transforms.ToTensor(),
+     transforms.Normalize((0.5,0.5,0.5),(0.5,0.5,0.5))])
+
+trainset=torchvision.datasets.CIFAR10(root='./torchdata', train=True,
+    download=True, transform=transform)
+
+trainloader=torch.utils.data.DataLoader(trainset, batch_size=default_batch,
+    shuffle=True, num_workers=2)
+
+testset=torchvision.datasets.CIFAR10(root='./torchdata', train=False,
+    download=True, transform=transform)
+
+testloader=torch.utils.data.DataLoader(testset, batch_size=default_batch,
+    shuffle=False, num_workers=0)
+
+classes=('plane', 'car', 'bird', 'cat', 
+  'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
+
+import matplotlib.pyplot as plt
+import numpy as np
+from torch.autograd import Variable
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models.resnet import resnet18 as _resnet18
-from einops import rearrange, reduce, repeat
-
-from tensorflow.keras.datasets import mnist, cifar10 # to load dataset
-
-from functions.utils import compute_stats, get_grad
-from torch.optim import LBFGS, Adam
-
-# Parameters for L-BFGS training
-max_iter = 200                      # note each iteration is NOT an epoch
-ghost_batch = 128
-batch_size = 128
-overlap_ratio = 0.25                # should be in (0, 0.5)
-lr = 0.01
-
-# Load data
-(X_train, y_train), (X_test, y_test) = cifar10.load_data()
-X_train = X_train.astype('float32')
-X_test = X_test.astype('float32')
-X_train = X_train / 255
-X_test = X_test / 255
-if len(X_train.shape) == 3:
-    X_train = repeat(X_train, 'b h w -> b c h w', c = 3)
-    X_test = repeat(X_test, 'b h w -> b c h w', c = 3)
-else:
-    X_train = rearrange(X_train, 'b h w c -> b c h w')
-    X_test = rearrange(X_test, 'b h w c -> b c h w')
-# X_train = np.transpose(X_train, (0, 3, 1, 2))
-# X_test = np.transpose(X_test, (0, 3, 1, 2))
-
-# Define network
-def resnet18(pretrained=False, **kwargs):
-    """ # This docstring shows up in hub.help()
-    Resnet18 model
-    pretrained (bool): kwargs, load pretrained weights into the model
-    """
-    # Call the model, load pretrained weights
-    model = _resnet18(pretrained=pretrained, **kwargs)
-    return model
-
-# Check cuda availability
-cuda = torch.cuda.is_available()
-
-# Create neural network model
-if cuda:
-    torch.cuda.manual_seed(2018)
-    model = resnet18().cuda()
-else:
-    torch.manual_seed(2018)
-    model = resnet18()
-
-# Define helper functions
-
-# Forward pass
-if cuda:
-    opfun = lambda X: model.forward(torch.from_numpy(X).cuda())
-else:
-    opfun = lambda X: model.forward(torch.from_numpy(X))
-
-# Forward pass through the network given the input
-if cuda:
-    predsfun = lambda op: np.argmax(op.cpu().data.numpy(), 1)
-else:
-    predsfun = lambda op: np.argmax(op.data.numpy(), 1)
-
-# Do the forward pass, then compute the accuracy
-accfun = lambda op, y: np.mean(np.equal(predsfun(op), y.squeeze())) * 100
-
-# Define optimizer
-optimizer = Adam(model.parameters(), lr=lr)
-
-# Main training loop
-no_samples = X_train.shape[0]
-
-# compute initial gradient and objective
-# grad, obj = get_grad(optimizer, X_train, y_train, opfun)
-
-# main loop
-for n_iter in range(max_iter):
-
-    # training mode
-    model.train()
-
-    # define closure for line search
 
 
-    optimizer.zero_grad()
+#####################################################
+def verification_error_check(net):
+   correct=0
+   total=0
+   for data in testloader:
+     images,labels=data
+     outputs=net(Variable(images).to(mydevice))
+     _,predicted=torch.max(outputs.data,1)
+     correct += (predicted==labels.to(mydevice)).sum()
+     total += labels.size(0)
 
-    if cuda:
-        loss_fn = torch.tensor(0, dtype=torch.float).cuda()
+   return 100*correct//total
+#####################################################
+
+net = torchvision.models.resnet18(pretrained=False).cuda()
+
+# loss function and optimizer
+import torch.optim as optim
+# from lbfgsnew import LBFGSNew # custom optimizer
+criterion=nn.CrossEntropyLoss()
+#optimizer=optim.SGD(net.parameters(), lr=0.001, momentum=0.9)
+optimizer=optim.Adam(net.parameters(), lr=0.001)
+# optimizer = LBFGSNew(net.parameters(), history_size=7, max_iter=2, line_search_fn=True,batch_mode=True)
+
+start_time=time.time()
+use_lbfgs=True
+# train network
+for epoch in range(20):
+  running_loss=0.0
+  for i,data in enumerate(trainloader,0):
+    # get the inputs
+    inputs,labels=data
+    # wrap them in variable
+    inputs,labels=Variable(inputs).to(mydevice),Variable(labels).to(mydevice)
+
+    if not use_lbfgs:
+     # zero gradients
+     optimizer.zero_grad()
+     # forward+backward optimize
+     outputs=net(inputs)
+     loss=criterion(outputs,labels)
+     loss.backward()
+     optimizer.step()
     else:
-        loss_fn = torch.tensor(0, dtype=torch.float)
+      def closure():
+        if torch.is_grad_enabled():
+         optimizer.zero_grad()
+        outputs=net(inputs)
+        loss=criterion(outputs,labels)
+        if loss.requires_grad:
+          loss.backward()
+          #print('loss %f l1 %f l2 %f'%(loss,l1_penalty,l2_penalty))
+        return loss
+      optimizer.step(closure)
+    # only for diagnostics
+    outputs=net(inputs)
+    loss=criterion(outputs,labels)
+    running_loss +=loss.data.item()
 
-    for subsmpl in np.array_split(np.arange(no_samples), max(int(no_samples / ghost_batch), 1)):
+    if math.isnan(loss.data.item()):
+       print('loss became nan at %d'%i)
+       break
 
-        ops = opfun(X_train[subsmpl])
+    # print statistics
+    if i%(batches_for_report) == (batches_for_report-1): # after every 'batches_for_report'
+      print('%f: [%d, %5d] loss: %.5f accuracy: %.3f'%
+         (time.time()-start_time,epoch+1,i+1,running_loss/batches_for_report,
+         verification_error_check(net)))
+      running_loss=0.0
 
-        if cuda:
-            tgts = torch.from_numpy(y_train[subsmpl]).cuda().long().squeeze()
-        else:
-            tgts = torch.from_numpy(y_train[subsmpl]).long().squeeze()
+print('Finished Training')
 
-        loss_fn += F.cross_entropy(ops, tgts) * (len(subsmpl) / no_samples)
-    loss_fn.backward(loss_fn)
 
-    # perform line search step
-    # options = {'closure': closure, 'current_loss': obj}
-    optimizer.step()
+# save model (and other extra items)
+# torch.save({
+#             'model_state_dict':net.state_dict(),
+#             'epoch':epoch,
+#             'optimizer_state_dict':optimizer.state_dict(),
+#             'running_loss':running_loss,
+#            },'./res.model')
 
-    # compute statistics
-    model.eval()
-    train_loss, test_loss, test_acc = compute_stats(X_train, y_train, X_test, y_test, opfun, accfun,
-                                                    ghost_batch=128)
 
-    # print data
-    print('Iter:', n_iter + 1, 'lr:', lr, 'Training Loss:', train_loss, 'Test Loss:', test_loss,
-          'Test Accuracy:', test_acc)
+# whole dataset
+correct=0
+total=0
+for data in trainloader:
+   images,labels=data
+   outputs=net(Variable(images).to(mydevice)).cpu()
+   _,predicted=torch.max(outputs.data,1)
+   total += labels.size(0)
+   correct += (predicted==labels).sum()
+   
+print('Accuracy of the network on the %d train images: %d %%'%
+    (total,100*correct//total))
+
+correct=0
+total=0
+for data in testloader:
+   images,labels=data
+   outputs=net(Variable(images).to(mydevice)).cpu()
+   _,predicted=torch.max(outputs.data,1)
+   total += labels.size(0)
+   correct += (predicted==labels).sum()
+   
+print('Accuracy of the network on the %d test images: %d %%'%
+    (total,100*correct//total))
+
+
+class_correct=list(0. for i in range(10))
+class_total=list(0. for i in range(10))
+for data in testloader:
+  images,labels=data
+  outputs=net(Variable(images).to(mydevice)).cpu()
+  _,predicted=torch.max(outputs.data,1)
+  c=(predicted==labels).squeeze()
+  for i in range(4):
+    label=labels[i]
+    class_correct[label] += c[i]
+    class_total[label] += 1
+
+for i in range(10):
+  print('Accuracy of %5s : %2d %%' %
+    (classes[i],100*float(class_correct[i])/float(class_total[i])))
